@@ -1,1 +1,110 @@
-s
+name: Crypto 15m Monitor
+
+on:
+  schedule:
+    # 3 minutes after each 15m boundary: :03, :18, :33, :48 UTC.
+    # This gives Bitstamp a small buffer after the candle close.
+    - cron: "3,18,33,48 * * * *"
+      timezone: "UTC"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: crypto-15m-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-market:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "requests>=2.32,<3"
+
+      - name: Validate Python Syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile email_code.py
+
+      - name: Run Market Monitor
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          PYTHONUNBUFFERED: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EMAIL_SENDER"
+          test -n "$EMAIL_PASSWORD"
+          python email_code.py
+
+      - name: Commit and Push State
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state.json
+
+          if git diff --cached --quiet -- state.json; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update state [skip ci]"
+
+          # Rebase once against current main before push. The workflow has a
+          # concurrency lock, so monitor runs cannot overlap each other.
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+
+      - name: Delete Old Workflow Runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Keeping the 3 newest runs of this workflow."
+
+          OLD_RUN_IDS=$(gh run list \
+            --workflow "$GITHUB_WORKFLOW" \
+            --limit 1000 \
+            --json databaseId \
+            --jq '.[3:] | .[].databaseId')
+
+          if [ -z "$OLD_RUN_IDS" ]; then
+            echo "No old workflow runs to delete."
+            exit 0
+          fi
+
+          for RUN_ID in $OLD_RUN_IDS; do
+            echo "Deleting workflow run $RUN_ID"
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+              >/dev/null || true
+          done
