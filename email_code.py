@@ -1,16 +1,15 @@
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
 import copy
 import json
 import math
 import os
 import smtplib
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -78,6 +77,30 @@ ALLOW_DAILY_OPEN_SWEEP_TRIGGER = True
 
 # Safety buffer in seconds after the exact 15m boundary before polling Bitstamp
 CANDLE_CLOSE_BUFFER_SECONDS = 15
+
+
+# ============================================================
+# RENDER DUMMY WEB SERVER (PORT BINDING)
+# ============================================================
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - Crypto 15m Monitor Daemon Running")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return  # Suppress HTTP access logging to keep console clean
+
+
+def start_health_check_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    server_address = ("0.0.0.0", port)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    print(f"Health check server listening on port {port} for Render deployment...")
+    httpd.serve_forever()
 
 
 # ============================================================
@@ -1133,6 +1156,9 @@ def run_cycle(state: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    # 1. Start lightweight background health check server for Render port-binding
+    threading.Thread(target=start_health_check_server, daemon=True).start()
+
     state = load_state()
     print("Starting Always-On 24/7 Crypto Monitor Daemon...")
 
