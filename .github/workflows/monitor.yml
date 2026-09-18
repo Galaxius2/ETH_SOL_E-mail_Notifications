@@ -5,7 +5,6 @@ on:
     # 3 minutes after each 15m boundary: :03, :18, :33, :48 UTC.
     # This gives Bitstamp a small buffer after the candle close.
     - cron: "3,18,33,48 * * * *"
-      timezone: "UTC"
   workflow_dispatch:
 
 permissions:
