@@ -66,17 +66,15 @@ MIN_RR = 2.0
 # A CHoCH setup cannot remain valid forever.
 CHOCH_MAX_AGE_SECONDS = 8 * 60 * 60
 
-# A scheduled GitHub run can be delayed. We only send a "live" alert for the
-# newest completed 15m candle when that candle closed recently enough.
-# Older candles may still be replayed silently to reconstruct state.
-MAX_LIVE_ALERT_AGE_SECONDS = 20 * 60
-
 # Long-only system. Bearish HTF structure blocks long execution.
 ALLOWED_LONG_HTF_BIAS = {"BULLISH", "RANGE"}
 
 # Daily Open Sweep is retained as an allowed Level 3 trigger when the price is
 # already inside the frozen POI.
 ALLOW_DAILY_OPEN_SWEEP_TRIGGER = True
+
+# Safety buffer in seconds after the exact 15m boundary before polling Bitstamp
+CANDLE_CLOSE_BUFFER_SECONDS = 15
 
 
 # ============================================================
@@ -737,7 +735,7 @@ def execute_trade(
     print(
         f"LEVEL 3 EXECUTION: {name} | {trigger_label} | "
         f"entry={entry:.6f} fail={invalidation:.6f} tp={tp:.6f} RR={rr:.2f} | "
-        f"alert={'YES' if send_alerts else 'NO (historical replay)'}"
+        f"alert={'YES' if send_alerts else 'NO'}"
     )
     return True
 
@@ -865,7 +863,7 @@ def process_one_15m_candle(
             print(f"{name}: CHoCH cancelled - frozen FTA already reached.")
             return
 
-        # ΑΥΣΤΗΡΟΣ ΕΛΕΓΧΟΣ POI: Το Retest πρέπει να εκτελείται αποκλειστικά εντός POI
+        # STRICT POI: The Retest must occur strictly inside the frozen POI
         if current_price > frozen_upper:
             clear_setup(asset_state)
             print(f"{name}: CHoCH retest occurred above frozen POI -> invalidated.")
@@ -913,9 +911,7 @@ def process_one_15m_candle(
             if send_alerts:
                 send_level_2_fail_alert(name, current_price)
             clear_setup(asset_state)
-            print(
-                f"{name}: Level 2 FAIL | alert={'YES' if send_alerts else 'NO (historical replay)'}"
-            )
+            print(f"{name}: Level 2 FAIL | alert={'YES' if send_alerts else 'NO'}")
             return
 
         if current_price > poi_upper and not candle_touches_zone(current, poi_lower, poi_upper):
@@ -952,7 +948,7 @@ def process_one_15m_candle(
             f"{name}: POI_ACTIVE | support={dynamic_poi['support']:.6f} "
             f"zone={dynamic_poi['lower']:.6f}-{dynamic_poi['upper']:.6f} "
             f"FTA={dynamic_poi['fta']:.6f} | "
-            f"alert={'YES' if send_alerts else 'NO (historical replay)'}"
+            f"alert={'YES' if send_alerts else 'NO'}"
         )
         return
 
@@ -1014,7 +1010,7 @@ def process_one_15m_candle(
 
 
 # ============================================================
-# PER-ASSET RECOVERY LOOP
+# PER-ASSET ANALYSIS & PIPELINE
 # ============================================================
 
 
@@ -1054,7 +1050,7 @@ def analyze_asset(
     latest_closed_ts = candle_ts(ltf_closed[-1])
     last_processed = int(asset_state.get("last_processed_15m", 0))
 
-    # First run/bootstrap: do NOT replay old candles and send historical emails.
+    # Bootstrap on fresh deployment: set cursor to latest candle without alerts
     if last_processed <= 0:
         asset_state["last_processed_15m"] = latest_closed_ts
         asset_state["status"] = "IDLE"
@@ -1065,7 +1061,6 @@ def analyze_asset(
             f"{name}: initial bootstrap -> cursor set to {latest_closed_ts}; "
             f"no historical alerts sent."
         )
-        save_state(state)
         return
 
     pending_indices = [
@@ -1078,18 +1073,13 @@ def analyze_asset(
         return
 
     latest_pending_index = pending_indices[-1]
-    now_ts = utc_now_ts()
 
     for index in pending_indices:
         current_ts = candle_ts(ltf_closed[index])
         before_snapshot = copy.deepcopy(asset_state)
 
+        # In always-on daemon mode, the newest closed candle is always live
         is_latest_pending = index == latest_pending_index
-        completed_age = max(0, now_ts - candle_close_ts(ltf_closed[index]))
-        live_alerts = (
-            is_latest_pending
-            and completed_age <= MAX_LIVE_ALERT_AGE_SECONDS
-        )
 
         try:
             process_one_15m_candle(
@@ -1099,7 +1089,7 @@ def analyze_asset(
                 index,
                 daily_candles,
                 htf_closed_now,
-                send_alerts=live_alerts,
+                send_alerts=is_latest_pending,
             )
         except Exception:
             asset_state.clear()
@@ -1107,19 +1097,23 @@ def analyze_asset(
             raise
 
         asset_state["last_processed_15m"] = current_ts
-        save_state(state)
-
-        if is_latest_pending:
-            print(
-                f"{name}: latest candle processed; close_age={completed_age}s; "
-                f"live_alerts={'ENABLED' if live_alerts else 'DISABLED'}"
-            )
 
 
-def main() -> None:
-    state = load_state()
+# ============================================================
+# 24/7 DAEMON EXECUTION
+# ============================================================
+
+
+def get_seconds_until_next_15m() -> int:
+    """Calculate exact seconds until next :00, :15, :30, :45 + safety buffer."""
+    now = utc_now_ts()
+    remainder = now % LTF_STEP
+    sleep_needed = (LTF_STEP - remainder) + CANDLE_CLOSE_BUFFER_SECONDS
+    return sleep_needed
+
+
+def run_cycle(state: Dict[str, Any]) -> None:
     errors: List[str] = []
-
     for asset_name, pair_code in PAIRS.items():
         try:
             analyze_asset(asset_name, pair_code, state)
@@ -1129,22 +1123,36 @@ def main() -> None:
             errors.append(message)
 
     save_state(state)
-
     if errors:
-        print("One or more assets failed:")
-        for error in errors:
-            print(f"  - {error}")
-        raise RuntimeError("Crypto monitor completed with errors.")
+        print("Cycle completed with errors on one or more assets.")
+    else:
+        print("Cycle completed successfully.")
 
-    print("Crypto monitor completed successfully.")
+
+def main() -> None:
+    state = load_state()
+    print("Starting Always-On 24/7 Crypto Monitor Daemon...")
+
+    # Immediate first check upon starting
+    run_cycle(state)
+
+    while True:
+        seconds_to_wait = get_seconds_until_next_15m()
+        target_time = datetime.fromtimestamp(utc_now_ts() + seconds_to_wait, timezone.utc)
+        print(
+            f"Sleeping {seconds_to_wait}s until next check at "
+            f"{target_time.strftime('%H:%M:%S')} UTC..."
+        )
+        time.sleep(seconds_to_wait)
+        run_cycle(state)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("Interrupted.")
+        print("Daemon stopped by user.")
         sys.exit(130)
     except Exception as exc:
-        print(f"FATAL: {exc}")
+        print(f"FATAL DAEMON ERROR: {exc}")
         sys.exit(1)
