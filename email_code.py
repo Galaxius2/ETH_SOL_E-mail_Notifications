@@ -6,6 +6,7 @@ import smtplib
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
@@ -83,16 +84,25 @@ CANDLE_CLOSE_BUFFER_SECONDS = 15
 # RENDER DUMMY WEB SERVER (PORT BINDING)
 # ============================================================
 
+# Κρατάει αυστηρά μόνο τα 2 τελευταία pings. Το 3ο διαγράφεται αυτόματα!
+recent_pings = deque(maxlen=2)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
+    def do_GET(self):
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        recent_pings.append(f"[{now_str}] Ping received - Status 200 OK")
+        
+        response_text = "=== CRYPTO MONITOR LIVE HEARTBEAT ===\n"
+        for i, ping in enumerate(recent_pings, 1):
+            response_text += f"{i}. {ping}\n"
+        
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Crypto 15m Monitor Daemon Running")
+        self.wfile.write(response_text.encode("utf-8"))
 
-    def log_message(self, format: str, *args: Any) -> None:
-        return  # Suppress HTTP access logging to keep console clean
+    def log_message(self, format, *args):
+        pass
 
 
 def start_health_check_server() -> None:
@@ -1174,6 +1184,10 @@ def main() -> None:
         )
         time.sleep(seconds_to_wait)
         run_cycle(state)
+        print(
+            f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] "
+            f"Checked ETH & SOL (15m CDC). System Active."
+        )
 
 
 if __name__ == "__main__":
