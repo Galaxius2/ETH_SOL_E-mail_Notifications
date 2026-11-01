@@ -55,16 +55,16 @@ SWING_LEFT = 2
 SWING_RIGHT = 2
 
 # Dynamic strategy parameters. No fixed ETH/SOL price levels are used.
-POI_BELOW_SUPPORT_PCT = 0.004       # 0.4% below HTF support
-POI_ABOVE_SUPPORT_PCT = 0.008       # 0.8% above HTF support
+POI_BELOW_SUPPORT_PCT = 0.006       # 0.6% below HTF support
+POI_ABOVE_SUPPORT_PCT = 0.018       # 1.8% above HTF support
 INVALIDATION_BUFFER_PCT = 0.002     # 0.2% below trigger/retest wick
 
 # Retest tolerance around the broken 15m CHoCH level.
-RETEST_TOLERANCE_PCT = 0.002        # 0.2% above broken level
-RETEST_MAX_DEPTH_PCT = 0.005        # 0.5% penetration below broken level
+RETEST_TOLERANCE_PCT = 0.003        # 0.3% above broken level
+RETEST_MAX_DEPTH_PCT = 0.006        # 0.6% penetration below broken level
 
 # Minimum reward/risk required before a Level 3 email is sent.
-MIN_RR = 2.0
+MIN_RR = 1.5
 
 # A CHoCH setup cannot remain valid forever.
 CHOCH_MAX_AGE_SECONDS = 8 * 60 * 60
@@ -84,7 +84,6 @@ CANDLE_CLOSE_BUFFER_SECONDS = 15
 # RENDER DUMMY WEB SERVER (PORT BINDING)
 # ============================================================
 
-# Κρατάει αυστηρά μόνο τα 2 τελευταία pings. Το 3ο διαγράφεται αυτόματα!
 recent_pings = deque(maxlen=2)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -480,13 +479,6 @@ def find_confirmed_swing_highs(
 
 
 def determine_htf_bias(htf_closed: List[Dict[str, Any]]) -> str:
-    """
-    Determine simple 4H structural bias from confirmed fractals.
-
-    BULLISH = latest confirmed swing high and low are both higher than previous.
-    BEARISH = latest confirmed swing high and low are both lower than previous.
-    RANGE   = mixed/non-directional structure or insufficient information.
-    """
     highs = find_confirmed_swing_highs(htf_closed)
     lows = find_confirmed_swing_lows(htf_closed)
 
@@ -511,7 +503,6 @@ def find_htf_key_levels(
     htf_closed: List[Dict[str, Any]],
     current_price: float,
 ) -> Tuple[Optional[float], Optional[float], str]:
-    """Find nearest confirmed 4H swing low below price, nearest swing high above price, and bias."""
     if len(htf_closed) < (SWING_LEFT + SWING_RIGHT + 4):
         return None, None, "RANGE"
 
@@ -543,7 +534,6 @@ def find_latest_confirmed_swing_high(
 def has_recent_bearish_structure(
     candles_before_trigger: List[Dict[str, Any]],
 ) -> bool:
-    """Require a basic recent LH/LL sequence before calling a break CHoCH."""
     highs = find_confirmed_swing_highs(candles_before_trigger)
     lows = find_confirmed_swing_lows(candles_before_trigger)
 
@@ -557,12 +547,6 @@ def detect_bullish_choch(
     ltf_history_before_trigger: List[Dict[str, Any]],
     current_candle: Dict[str, Any],
 ) -> Tuple[bool, Optional[float]]:
-    """
-    Bullish CHoCH requires:
-      1) confirmed recent LH/LL structure, and
-      2) the newest closed 15m candle closes bullish above its latest
-         confirmed swing high.
-    """
     if len(ltf_history_before_trigger) < 12:
         return False, None
 
@@ -585,7 +569,6 @@ def detect_daily_open_sweep(
     current_candle: Dict[str, Any],
     daily_open: float,
 ) -> bool:
-    """Detect a bullish Daily Open sweep/reclaim on the closed 15m candle."""
     prev_low = candle_float(prev_candle, "low")
     curr_low = candle_float(current_candle, "low")
     curr_close = candle_float(current_candle, "close")
@@ -601,7 +584,6 @@ def detect_retest_of_choch(
     current_candle: Dict[str, Any],
     break_level: float,
 ) -> bool:
-    """Confirm a bullish retest/reclaim of the broken 15m structure level."""
     curr_low = candle_float(current_candle, "low")
     curr_close = candle_float(current_candle, "close")
 
@@ -877,7 +859,6 @@ def process_one_15m_candle(
         detected_at = int(choch.get("detected_at", 0))
         frozen_fta = float(poi.get("fta", 0.0))
         frozen_lower = float(poi.get("lower", 0.0))
-        frozen_upper = float(poi.get("upper", 0.0))
 
         if break_level <= 0 or frozen_fta <= 0 or detected_at <= 0:
             clear_setup(asset_state)
@@ -899,20 +880,13 @@ def process_one_15m_candle(
             print(f"{name}: CHoCH cancelled - frozen FTA already reached.")
             return
 
-        # STRICT POI: The Retest must occur strictly inside the frozen POI
-        if current_price > frozen_upper:
+        # Check for invalidation below the HTF POI base
+        if current_price < frozen_lower:
             clear_setup(asset_state)
-            print(f"{name}: CHoCH retest occurred above frozen POI -> invalidated.")
+            print(f"{name}: CHoCH setup invalidated below frozen POI base.")
             return
 
-        # Long execution requires price above Daily Open.
-        if current_price <= daily_open:
-            print(f"{name}: waiting - CHoCH retest candle is below/equal DO.")
-            if current_price < frozen_lower:
-                clear_setup(asset_state)
-                print(f"{name}: CHoCH setup invalidated below frozen POI.")
-            return
-
+        # Retest detection around the broken structure level
         if detect_retest_of_choch(current, break_level):
             execute_trade(
                 name,
@@ -924,9 +898,6 @@ def process_one_15m_candle(
             )
             return
 
-        if current_price < frozen_lower:
-            clear_setup(asset_state)
-            print(f"{name}: CHoCH setup invalidated below frozen POI.")
         return
 
     # --------------------------------------------------------
@@ -1006,25 +977,23 @@ def process_one_15m_candle(
     if htf_bias not in ALLOWED_LONG_HTF_BIAS:
         return
 
-    if current_price <= daily_open:
-        return
-
-    # A) Daily Open sweep/reclaim inside POI.
-    if ALLOW_DAILY_OPEN_SWEEP_TRIGGER and detect_daily_open_sweep(
-        previous,
-        current,
-        daily_open,
-    ):
-        executed = execute_trade(
-            name,
-            asset_state,
-            current,
+    # A) Daily Open sweep/reclaim inside POI (requires current_price > daily_open)
+    if ALLOW_DAILY_OPEN_SWEEP_TRIGGER and current_price > daily_open:
+        if detect_daily_open_sweep(
             previous,
-            trigger_label="Daily Open Sweep",
-            send_alerts=send_alerts,
-        )
-        if executed:
-            return
+            current,
+            daily_open,
+        ):
+            executed = execute_trade(
+                name,
+                asset_state,
+                current,
+                previous,
+                trigger_label="Daily Open Sweep",
+                send_alerts=send_alerts,
+            )
+            if executed:
+                return
 
     # B) Bullish 15m CHoCH.
     history_before_trigger = all_ltf_closed[:index]
