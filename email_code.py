@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.header import Header
 from email.mime.text import MIMEText
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -237,6 +237,40 @@ def candle_is_recently_closed(candle: Dict[str, Any], now_ts: int) -> bool:
     close_ts = candle_close_ts(candle, LTF_STEP)
     age = now_ts - close_ts
     return 0 <= age <= RECENT_SIGNAL_MAX_AGE_SECONDS
+
+
+def format_audit_metadata(
+    candle_timestamp: int,
+    extra_lines: List[str],
+) -> str:
+    now_utc = datetime.now(timezone.utc)
+    # Greece timezone calculation: UTC+2 winter / UTC+3 summer
+    is_dst = bool(time.localtime().tm_isdst > 0)
+    gr_offset = timedelta(hours=3 if is_dst else 2)
+    now_gr = now_utc + gr_offset
+
+    sent_str = (
+        f"{now_gr.strftime('%d/%m/%Y %H:%M:%S')} gr "
+        f"({now_utc.strftime('%H:%M:%S')} utc)"
+    )
+
+    open_dt = datetime.fromtimestamp(candle_timestamp, timezone.utc)
+    close_dt = datetime.fromtimestamp(candle_timestamp + LTF_STEP, timezone.utc)
+    candle_window = f"{open_dt.strftime('%H:%M')}-{close_dt.strftime('%H:%M')} utc"
+
+    age_sec = max(0, utc_now_ts() - (candle_timestamp + LTF_STEP))
+    status_label = f"live (lag: {age_sec}s)" if age_sec <= RECENT_SIGNAL_MAX_AGE_SECONDS else f"stale (lag: {age_sec}s)"
+
+    metadata_lines = [
+        "----------------------------------------------------------------------",
+        f"* sent: {sent_str} | candle: {candle_timestamp} ({candle_window})",
+        f"* status: {status_label}",
+    ]
+    for line in extra_lines:
+        metadata_lines.append(f"* {line}")
+    metadata_lines.append("----------------------------------------------------------------------")
+
+    return "\n" + "\n".join(metadata_lines)
 
 
 def validate_candle_series(
@@ -641,7 +675,18 @@ def send_email(subject: str, body: str) -> None:
     raise RuntimeError(f"Email delivery failed after {SMTP_RETRIES} attempts: {last_error}")
 
 
-def send_level_2_alert(name: str, price: float, candle_timestamp: int) -> None:
+def send_level_2_alert(
+    name: str,
+    price: float,
+    candle_timestamp: int,
+    *,
+    support: float,
+    poi_lower: float,
+    poi_upper: float,
+    fta: float,
+    daily_open: float,
+    htf_bias: str,
+) -> None:
     subject = f"🟠 {pair_clean(name)}: ΣΕ ΕΠΙΦΥΛΑΚΗ"
     body = (
         "Asset:\n"
@@ -651,10 +696,24 @@ def send_level_2_alert(name: str, price: float, candle_timestamp: int) -> None:
         "🟠\n"
         "      Κατάσταση: Είσοδος σε Ζώνη Ενδιαφέροντος (POI)"
     )
+    extra_metadata = [
+        f"support: {format_usd(support)} | zone: {format_usd(poi_lower)} - {format_usd(poi_upper)} | fta: {format_usd(fta)}",
+        f"do: {format_usd(daily_open)} | bias: {htf_bias}",
+    ]
+    body += format_audit_metadata(candle_timestamp, extra_metadata)
     deliver_alert_once(name, "LEVEL_2_READY", candle_timestamp, subject, body)
 
 
-def send_level_2_fail_alert(name: str, price: float, candle_timestamp: int) -> None:
+def send_level_2_fail_alert(
+    name: str,
+    price: float,
+    candle_timestamp: int,
+    *,
+    poi_lower: float,
+    daily_open: float,
+    htf_bias: str,
+    support: Optional[float] = None,
+) -> None:
     subject = f"🔴 {pair_clean(name)}: FAIL"
     body = (
         "Asset:\n"
@@ -664,6 +723,12 @@ def send_level_2_fail_alert(name: str, price: float, candle_timestamp: int) -> N
         "🔴\n"
         "      ΑΚΥΡΩΣΗ ΕΤΟΙΜΟΤΗΤΑΣ"
     )
+    support_str = format_usd(support) if support is not None else "n/a"
+    extra_metadata = [
+        f"event: poi_floor_breach (< {format_usd(poi_lower)}) | action: reset_idle",
+        f"support: {support_str} | do: {format_usd(daily_open)} | bias: {htf_bias}",
+    ]
+    body += format_audit_metadata(candle_timestamp, extra_metadata)
     deliver_alert_once(name, "LEVEL_2_FAIL", candle_timestamp, subject, body)
 
 
@@ -673,6 +738,13 @@ def send_level_3_alert(
     invalidation: float,
     take_profit: float,
     candle_timestamp: int,
+    *,
+    rr: float,
+    trigger_label: str,
+    support: float,
+    daily_open: float,
+    htf_bias: str,
+    break_level: Optional[float] = None,
 ) -> None:
     subject = f"🚨 LEVEL 3: {pair_clean(name)} EXECUTION"
     body = (
@@ -683,6 +755,12 @@ def send_level_3_alert(
         f"ΑΠΟΤΥΧΙΑ: {format_usd(invalidation)}\n\n"
         f"Take Profit: {format_usd(take_profit)}"
     )
+    break_str = format_usd(break_level) if break_level is not None else "n/a"
+    extra_metadata = [
+        f"trigger: {trigger_label} | rr: 1:{rr:.2f}",
+        f"break_level: {break_str} | support: {format_usd(support)} | do: {format_usd(daily_open)} | bias: {htf_bias}",
+    ]
+    body += format_audit_metadata(candle_timestamp, extra_metadata)
     deliver_alert_once(name, "LEVEL_3_EXECUTION", candle_timestamp, subject, body)
 
 
@@ -1065,6 +1143,9 @@ def execute_trade(
     previous_candle: Dict[str, Any],
     trigger_label: str,
     *,
+    daily_open: float,
+    htf_bias: str,
+    break_level: Optional[float] = None,
     send_alerts: bool,
 ) -> bool:
     """Activate a candle-based signal state; this does not place an exchange order."""
@@ -1076,6 +1157,7 @@ def execute_trade(
     entry = candle_float(current_candle, "close")
     invalidation = calculate_invalidation(current_candle, previous_candle)
     take_profit = float(poi["fta"])
+    support = float(poi.get("support", 0.0))
 
     rr = validate_execution(entry, invalidation, take_profit)
     if rr is None:
@@ -1094,6 +1176,12 @@ def execute_trade(
             invalidation,
             take_profit,
             current_ts,
+            rr=rr,
+            trigger_label=trigger_label,
+            support=support,
+            daily_open=daily_open,
+            htf_bias=htf_bias,
+            break_level=break_level,
         )
     else:
         raise RuntimeError(
@@ -1203,7 +1291,7 @@ def record_daily_sweep(
     current_candle: Dict[str, Any],
     daily_open: float,
 ) -> bool:
-    """Step A only: a 15m wick trades below today's UTC Daily Open."""
+    """Record Step A. Returns True when a new/current-day sweep was stored."""
     if not daily_open_sweep_detected(current_candle, daily_open):
         return False
 
@@ -1321,6 +1409,7 @@ def process_one_15m_candle(
         frozen_fta = float(poi.get("fta", 0.0))
         frozen_lower = float(poi.get("lower", 0.0))
         frozen_upper = float(poi.get("upper", 0.0))
+        support = float(poi.get("support", 0.0))
 
         if (
             break_level <= 0
@@ -1355,7 +1444,15 @@ def process_one_15m_candle(
 
         if current_price < frozen_lower:
             if send_alerts:
-                send_level_2_fail_alert(name, current_price, current_ts)
+                send_level_2_fail_alert(
+                    name,
+                    current_price,
+                    current_ts,
+                    poi_lower=frozen_lower,
+                    daily_open=daily_open,
+                    htf_bias=htf_bias,
+                    support=support,
+                )
             clear_setup(asset_state)
             print(f"{name}: CHoCH setup invalidated below frozen POI base.")
             return
@@ -1382,6 +1479,9 @@ def process_one_15m_candle(
                     current,
                     previous,
                     trigger_label="CHoCH + Retest",
+                    daily_open=daily_open,
+                    htf_bias=htf_bias,
+                    break_level=break_level,
                     send_alerts=True,
                 )
                 return
@@ -1401,6 +1501,7 @@ def process_one_15m_candle(
         poi_lower = float(poi.get("lower", 0.0))
         poi_upper = float(poi.get("upper", 0.0))
         frozen_fta = float(poi.get("fta", 0.0))
+        support = float(poi.get("support", 0.0))
 
         if poi_lower <= 0 or poi_upper <= poi_lower or frozen_fta <= 0:
             clear_setup(asset_state)
@@ -1425,7 +1526,15 @@ def process_one_15m_candle(
         # Invalidation is candle-close based and uses the frozen zone.
         if current_price < poi_lower:
             if send_alerts:
-                send_level_2_fail_alert(name, current_price, current_ts)
+                send_level_2_fail_alert(
+                    name,
+                    current_price,
+                    current_ts,
+                    poi_lower=poi_lower,
+                    daily_open=daily_open,
+                    htf_bias=htf_bias,
+                    support=support,
+                )
             journal_event(
                 name,
                 "POI_INVALIDATED",
@@ -1465,6 +1574,9 @@ def process_one_15m_candle(
                 current,
                 previous,
                 trigger_label="Daily Open Sweep + Reclaim",
+                daily_open=daily_open,
+                htf_bias=htf_bias,
+                break_level=None,
                 send_alerts=True,
             )
             if executed:
@@ -1580,7 +1692,17 @@ def process_one_15m_candle(
         )
 
         if send_alerts:
-            send_level_2_alert(name, current_price, current_ts)
+            send_level_2_alert(
+                name,
+                current_price,
+                current_ts,
+                support=dynamic_poi["support"],
+                poi_lower=dynamic_poi["lower"],
+                poi_upper=dynamic_poi["upper"],
+                fta=dynamic_poi["fta"],
+                daily_open=daily_open,
+                htf_bias=htf_bias,
+            )
 
         print(
             f"{name}: POI_ACTIVE | support={format_usd(dynamic_poi['support'])} "
