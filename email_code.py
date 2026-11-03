@@ -32,7 +32,7 @@ EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER") or EMAIL_SENDER
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
 SMTP_RETRIES = 3
-SMTP_RETRY_DELAY_SECONDS = 3
+SMTP_RETRY_DELAY_SECONDS = 5
 
 BITSTAMP_BASE_URL = "https://www.bitstamp.net/api/v2/ohlc"
 API_RETRIES = 4
@@ -462,11 +462,12 @@ def get_journal_connection() -> sqlite3.Connection:
 
 
 def retry_pending_alerts() -> None:
-    """Retry alerts that were eligible when created but could not be delivered."""
+    """Retry alerts that were eligible when created but could not be delivered, discarding expired alerts."""
+    now_ts = utc_now_ts()
     with get_journal_connection() as connection:
         rows = connection.execute(
             """
-            SELECT alert_key, subject, body
+            SELECT alert_key, subject, body, candle_ts
             FROM email_outbox
             WHERE status = 'PENDING'
             ORDER BY created_at_utc ASC
@@ -474,7 +475,21 @@ def retry_pending_alerts() -> None:
             """
         ).fetchall()
 
-    for alert_key, subject, body in rows:
+    for alert_key, subject, body, candle_timestamp in rows:
+        # TTL Check: Never deliver alerts whose signal candle closed long ago
+        if (now_ts - int(candle_timestamp)) > RECENT_SIGNAL_MAX_AGE_SECONDS:
+            with get_journal_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE email_outbox
+                    SET status = 'EXPIRED', last_error = 'DISCARDED_STALE_SIGNAL'
+                    WHERE alert_key = ?
+                    """,
+                    (alert_key,),
+                )
+            print(f"Discarded expired pending alert {alert_key} (age > {RECENT_SIGNAL_MAX_AGE_SECONDS}s)")
+            continue
+
         try:
             send_email(subject, body)
         except Exception as exc:
@@ -605,7 +620,7 @@ def send_email(subject: str, body: str) -> None:
 
     for attempt in range(1, SMTP_RETRIES + 1):
         try:
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=25) as server:
                 server.login(EMAIL_SENDER, EMAIL_PASSWORD)
                 server.sendmail(
                     EMAIL_SENDER,
@@ -1188,7 +1203,7 @@ def record_daily_sweep(
     current_candle: Dict[str, Any],
     daily_open: float,
 ) -> bool:
-    """Record Step A. Returns True when a new/current-day sweep was stored."""
+    """Step A only: a 15m wick trades below today's UTC Daily Open."""
     if not daily_open_sweep_detected(current_candle, daily_open):
         return False
 
